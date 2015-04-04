@@ -1,99 +1,134 @@
-var express = require('express')
-var session = require('express-session')
+var dotenv = require('dotenv');
+dotenv.load();
+var express = require('express');
+var bodyParser = require('body-parser');
+var session = require('cookie-session');
 var app = express();
-var request = require('request')
-var async = require('async')
-var cheerio = require('cheerio')
+var request = require('request');
+var async = require('async');
+var moment = require('moment');
+var sendgrid = require("sendgrid")(process.env.SENDGRID_USERNAME, process.env.SENDGRID_PASSWORD);
+var token_broker = "https://oauth.oit.duke.edu/oauth/token.php";
+var duke_card_host = "https://dukecard-proxy.oit.duke.edu";
+var auth_url = process.env.ROOT_URL + "/home/auth";
+var db = require('monk')(process.env.MONGOHQ_URL || "mongodb://localhost/foodpoints");
+var users = db.get("users");
+var balances = db.get("balances");
+var budgets = db.get("budgets");
 var passport = require('passport');
-var bcrypt = require('bcrypt');
-var LocalStrategy = require('passport-local').Strategy;
-var port = process.env.PORT || 3000
-var token_broker = "https://oauth.oit.duke.edu/oauth/token.php"
-var duke_card_host = "https://dukecard-proxy.oit.duke.edu"
-app.use(express.static(__dirname + '/public'))
-app.use(session({
-    secret: process.env.COOKIE_SECRET,
-    saveUninitialized: true,
-    resave: true
-}))
-app.use(passport.initialize())
-app.use(passport.session()) // persistent login;
-app.set('views', __dirname + '/views')
-app.set('view engine', 'jade')
-app.listen(port, function() {
-    console.log("Node app is running on port " + port)
-})
-passport.use(new LocalStrategy(function(username, password, done) {
-    User.findOne({
-        email: username
-    }, function(err, user) {
-        if(err) {
-            return done(err);
-        }
-        bcrypt.compare(password, user.password_hash, function(err, res) {
-            if(res) {
-                return done(null, user);
-            } else {
-                return done(null, false, {
-                    message: 'Login failure.'
-                });
-            }
-        });
-    });
-}));
-passport.serializeUser(function(user, done) {
-    done(null, user.id);
+users.index('id', {
+    unique: true
 });
-passport.deserializeUser(function(id, done) {
-    User.findById(id, function(err, user) {
-        done(err, user);
-    });
+app.set('view engine', 'jade');
+app.use(bodyParser.json());
+app.use(express.static(__dirname + '/public'));
+app.use(session({
+    secret: process.env.SESSION_SECRET
+}));
+app.use(passport.initialize());
+app.use(passport.session());
+app.locals.moment = moment;
+passport.serializeUser(function(user, done) {
+    done(null, user);
+});
+passport.deserializeUser(function(obj, done) {
+    done(null, obj);
+});
+var GoogleStrategy = require('passport-google-oauth').OAuth2Strategy;
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: process.env.ROOT_URL + "/auth/google/return"
+}, function(token, tokenSecret, profile, done) {
+    profile = profile._json;
+    console.log(profile);
+    done(null, profile);
+}));
+/*
+app.use(function(req, res, next) {
+        users.findOne({
+            _id: "54428cf327a1b318f9aaee7c"
+        }, function(err, doc) {
+            console.log(doc)
+            req.user = doc
+            next()
+        })
+    }
+})
+*/
+app.use(function(req, res, next) {
+    if (req.user) {
+        //user is logged in
+        users.findAndModify({
+            id: req.user.id
+        }, {
+            $set: req.user
+        }, {
+            upsert: true,
+            new: true
+        }, function(err, user) {
+            balances.find({
+                user_id: user._id
+            }, {
+                sort: {
+                    date: -1
+                }
+            }, function(err, bals) {
+                user.balances = bals;
+                getTransactions(user, function(err, trans) {
+                    user.trans = trans;
+                    req.user = user;
+                    next();
+                });
+            });
+        });
+    }
+    else {
+        next();
+    }
+});
+app.use("/api", function(req, res, next) {
+    if (req.user) {
+        next();
+    }
+    else {
+        res.status(403).json({
+            error: "Not logged in"
+        });
+    }
 });
 app.use(function(req, res, next) {
-    auth_url = req.protocol + '://' + req.get('host') + "/home/auth";
-    next();
-})
+    if (req.headers['x-forwarded-proto'] !== 'https' && process.env.NODE_ENV === "production") {
+        res.redirect(['https://', req.get('host'), req.url].join(''));
+    }
+    else {
+        next();
+    }
+});
+app.listen(process.env.PORT || 3000, function() {
+    console.log("Node app is running");
+});
+// Redirect the user to Google for authentication.  When complete, Google
+// will redirect the user back to the application at
+//     /auth/google/return
+app.get('/auth/google', passport.authenticate('google', {
+    scope: 'openid email'
+}));
+// Google will redirect the user to this URL after authentication.  Finish
+// the process by verifying the assertion.  If valid, the user will be
+// logged in.  Otherwise, authentication has failed.
+app.get('/auth/google/return', passport.authenticate('google', {
+    successRedirect: '/',
+    failureRedirect: '/'
+}));
 app.get('/', function(req, res) {
     res.render('index.jade', {
-        auth_link: "https://oauth.oit.duke.edu/oauth/authorize.php?response_type=code&client_id=" + process.env.API_ID + "&state=xyz&scope=food_points&redirect_uri=" + auth_url
-    })
-    //todo require https in production
-})
-app.get('/login', function(req, res) {
-    //todo
-})
-app.post('/login', function(req, res) {
-    //todo support sessions
-    passport.authenticate('local', {
-        successRedirect: '/',
-        failureRedirect: '/login',
-        failureFlash: true
-    })
-})
-app.get('/register', function(req, res) {
-    //todo
-})
-app.post('/register', function(req, res) {
-    //todo enforce email regex, password length
-    /*
-         before_save { self.email = email.downcase }
-    VALID_EMAIL_REGEX = /\A[\w+\-.]+@[a-z\d\-.]+\.[a-z]+\z/i
-    validates :email, presence:   true,
-    format:     { with: VALID_EMAIL_REGEX },
-    uniqueness: { case_sensitive: false }
-    has_secure_password
-    validates :password, length: { minimum: 6 }
-    */
-    var password = "test"
-    var salt = ""
-    bcrypt.hash(password, salt, function(err, hash) {
-        //todo store user
-        // Store hash in your password DB.
+        auth_link: "https://oauth.oit.duke.edu/oauth/authorize.php?response_type=code&client_id=" + process.env.API_ID + "&state=xyz&scope=food_points&redirect_uri=" + auth_url,
+        user: req.user
     });
-})
+});
 app.get('/home/auth', function(req, res) {
-    var code = req.query.code
-    console.log(code)
+    var code = req.query.code;
     request.post(token_broker, {
         auth: {
             'user': process.env.API_ID,
@@ -105,20 +140,284 @@ app.get('/home/auth', function(req, res) {
             redirect_uri: auth_url
         }
     }, function(err, resp, body) {
-        body = JSON.parse(body)
-        console.log(body)
-        //we only really care about the refresh token, which is valid for 6 months
-        //persist it in db and use to retrieve balances automatically
-        //get a single balance now to show the user
-        getBalance(body.refresh_token, function(err, bal) {
-            console.log(bal)
+        body = JSON.parse(body);
+        users.update({
+            _id: req.user._id
+        }, {
+            $set: {
+                refresh_token: body.refresh_token,
+                refresh_token_expire: new Date(moment().add(6, 'months'))
+            }
+        }, function(err) {
+            res.redirect('/');
+        });
+    });
+});
+
+app.get('/logout', function(req, res) {
+    req.logout();
+    req.session = null;
+    res.redirect('/');
+});
+//get user
+app.get('/api/user', function(req, res) {
+    res.json(req.user);
+});
+//create
+app.post('/api/budgets', function(req, res) {
+    req.body.user_id = req.user._id;
+    req.body.triggered = -1;
+    req.body.date = new Date();
+    budgets.insert(req.body, function(err, doc) {
+        res.send(doc);
+    });
+});
+//query
+app.get('/api/budgets', function(req, res) {
+    getBudgetStatus(req.user, function(err, docs) {
+        res.send(docs);
+    });
+});
+//delete
+app.delete('/api/budgets/:id', function(req, res) {
+    budgets.remove({
+        _id: req.params.id,
+        user_id: req.user._id
+    }, function(err) {
+        res.json({
+            deleted: 1
+        });
+    });
+});
+app.get('/api/cutoffs', function(req, res) {
+    res.send(getCutoffs());
+});
+/*
+app.get('/venues', function(req, res) {
+    request("http://studentaffairs.duke.edu/dining/venues-menus-hours", function(err, resp, body) {
+        var $ = cheerio.load(body)
+        var venues = []
+        var dates = []
+        var rows = $("#schedule_table tr")
+        rows.each(function(i, r) {
+            if ($(r).attr('id') === "schedule_header_row") {
+                //get dates
+                $(r).children().each(function(j, c) {
+                    var date = $(c).text().slice(3)
+                    dates.push(date)
+                })
+            }
+            else {
+                var v = {
+                    name: null,
+                    open: null,
+                    close: null
+                }
+                $(r).children().each(function(j, c) {
+                    var content = $(c).text()
+                    if (j === 0) {
+                        v.name = content
+                        v.link = $($(c).children()[0]).attr('href')
+                    }
+                    if (j === 1) {
+                        if (content !== "Closed") {
+                            var split = content.split("-")
+                            v.open = dates[j] + " " + split[0]
+                            v.close = dates[j] + " " + split[split.length - 1]
+                        }
+                        venues.push(v)
+                    }
+                })
+            }
         })
-        res.redirect("/")
+        res.json(venues)
     })
 })
+*/
 
-function getBalance(refresh_token, cb) {
-    //TODO handle error gracefully when the refresh token has expired
+updateBalances();
+
+function getCurrentBalance(user, cb) {
+    var access_token = user.access_token;
+    request.post(duke_card_host + "/food_points", {
+        form: {
+            access_token: access_token
+        }
+    }, function(err, resp, body) {
+        if (err || resp.statusCode != 200 || !body) {
+            console.log(err, body);
+            return cb("error getting balance");
+        }
+        body = JSON.parse(body);
+        cb(err, Number(body.food_points));
+    });
+}
+
+function validateTokens(user, cb) {
+    //refresh token expired, unset it
+    if (new Date() > user.refresh_token_expire) {
+        console.log("refresh token expired");
+        users.update({
+            _id: user._id
+        }, {
+            $unset: {
+                refresh_token: 1,
+                refresh_token_expire: 1
+            }
+        }, function(err) {
+            //can't update this user
+            return cb("refresh token expired");
+        });
+    }
+    //access token expired, get a new one
+    if (new Date() > user.access_token_expire || !user.access_token) {
+        console.log("access token expired");
+        getAccessToken(user, function(err, access_token) {
+            users.update({
+                _id: user._id
+            }, {
+                $set: {
+                    access_token: access_token,
+                    access_token_expire: new Date(moment().add(1, 'hour'))
+                }
+            }, function(err) {
+                console.log("got new access token %s", access_token);
+                user.access_token = access_token;
+                return cb(err);
+            });
+        });
+    }
+    else {
+        //valid token
+        console.log("tokens exist");
+        return cb(null);
+    }
+}
+
+function updateBalances() {
+    //function to continuously update balances
+    //for each user get their most recent balance
+    //get a new balance for that user
+    //only insert in db if number has changed
+    users.find({
+        refresh_token: {
+            $exists: true
+        }
+    }, function(err, res) {
+        if (err) {
+            console.log(err);
+            return updateBalances();
+        }
+        async.mapSeries(res, function(user, cb) {
+            //console.log(user)
+            validateTokens(user, function(err, access_token) {
+                if (err) {
+                    //log the error and move on to next user
+                    console.log(err);
+                    return cb(null);
+                }
+                getCurrentBalance(user, function(err, bal) {
+                    if (err) {
+                        console.log(err);
+                        return cb(null);
+                    }
+                    console.log("api balance: %s", bal);
+                    //get db balance
+                    balances.find({
+                        user_id: user._id
+                    }, {
+                        sort: {
+                            date: -1
+                        }
+                    }, function(err, bals) {
+                        var dbbal = bals[0];
+                        console.log(dbbal);
+                        //change in balance, or no balances
+                        if (!dbbal || Math.abs(dbbal.balance - bal) >= 0.01) {
+                            var newBal = {
+                                user_id: user._id,
+                                balance: bal,
+                                date: new Date()
+                            };
+                            balances.insert(newBal, function(err) {
+                                getBudgetStatus(user, function(err, docs) {
+                                    docs.forEach(function(budget) {
+                                        if (budget.spent >= budget.amount && budget.triggered < budget.cutoff) {
+                                            var text = "<p>Hello " + user.given_name + ",</p>";
+                                            text += '<p>You spent ' + budget.spent.toFixed(2) + ' this ' + budget.period + ', exceeding your budget of ' + budget.amount.toFixed(2) + '.</p>';
+                                            text += '<p>To stop receiving these emails, remove your budgeting alert at ' + process.env.ROOT_URL + '</p>';
+                                            sendEmail(text, user.email, function(err) {
+                                                budget.triggered = new Date();
+                                                budgets.update({
+                                                    _id: budget._id
+                                                }, budget);
+                                            });
+                                        }
+                                    });
+                                });
+
+                            });
+                        }
+                        //wait before next user
+                        setTimeout(cb, 60000);
+                    });
+                });
+            });
+        }, function(err) {
+            //done with a pass through all users, restart
+            updateBalances();
+        });
+    });
+}
+
+function getCutoffs() {
+    return {
+        'day': new Date(moment().startOf('day')),
+        'week': new Date(moment().startOf('week')),
+        'month': new Date(moment().startOf('month'))
+    };
+}
+
+function getBudgetStatus(user, cb) {
+    var cutoffs = getCutoffs();
+    getTransactions(user, function(err, trans) {
+        budgets.find({
+            user_id: user._id
+        }, {
+            sort: {
+                date: 1
+            }
+        }, function(err, docs) {
+            docs.forEach(function(budget) {
+                var cutoff = cutoffs[budget.period];
+                var exp = 0;
+                trans.forEach(function(tran) {
+                    exp += tran.date > cutoff && tran.amount < 0 ? Math.abs(tran.amount) : 0;
+                });
+                budget.spent = exp;
+                budget.cutoff = cutoff;
+            });
+            cb(err, docs);
+        });
+    });
+}
+
+function sendEmail(text, recipient, cb) {
+    var payload = {
+        html: text,
+        from: "no-reply",
+        to: recipient,
+        subject: 'FoodPoints+ Alert'
+    };
+    console.log(payload);
+    sendgrid.send(payload, function(err, json) {
+        console.log(json);
+        cb(err);
+    });
+}
+
+function getAccessToken(user, cb) {
+    var refresh_token = user.refresh_token;
     request.post(token_broker, {
         auth: {
             'user': process.env.API_ID,
@@ -129,75 +428,34 @@ function getBalance(refresh_token, cb) {
             refresh_token: refresh_token
         }
     }, function(err, resp, body) {
-        console.log(body)
-        body = JSON.parse(body)
-        //use the new access token
-        var access_token = body.access_token
-        request.post(duke_card_host + "/food_points", {
-            form: {
-                access_token: access_token
-            }
-        }, function(err, resp, body) {
-            console.log(body)
-            body = JSON.parse(body)
-            cb(null, body.food_points)
-        })
-    })
+        if (err || resp.statusCode != 200 || !body) {
+            return cb("error getting access token");
+        }
+        body = JSON.parse(body);
+        cb(err, body.access_token);
+    });
 }
 
-//setInterval(updateBalances, 5000)
-function updateBalances(){
-    //todo function to continuously update balances
-    //loop through all users in db
-    getBalance(user.refresh_token, function(err, bal){
-        console.log(bal)
-    })
-}
-app.get('/whatsopen', function(req, res) {
-    request("http://studentaffairs.duke.edu/dining/venues-menus-hours", function(err, resp, body) {
-        var $ = cheerio.load(body)
-        res.send($.html("#schedule_table"))
-    })
-})
-/*
-var http = require('http');
-var pg = require('pg');
-var conString = "postgres://username:password@localhost/database";
-var server = http.createServer(function(req, res) {
-    // get a pg client from the connection pool
-    pg.connect(conString, function(err, client, done) {
-        var handleError = function(err) {
-            // no error occurred, continue with the request
-            if(!err) return false;
-            // An error occurred, remove the client from the connection pool.
-            // A truthy value passed to done will remove the connection from the pool
-            // instead of simply returning it to be reused.
-            // In this case, if we have successfully received a client (truthy)
-            // then it will be removed from the pool.
-            done(client);
-            res.writeHead(500, {
-                'content-type': 'text/plain'
-            });
-            res.end('An error occurred');
-            return true;
-        };
-        // record the visit
-        client.query('INSERT INTO visit (date) VALUES ($1)', [new Date()], function(err, result) {
-            // handle an error from the query
-            if(handleError(err)) return;
-            // get the total number of visits today (including the current visit)
-            client.query('SELECT COUNT(date) AS count FROM visit', function(err, result) {
-                // handle an error from the query
-                if(handleError(err)) return;
-                // return the client to the connection pool for other requests to reuse
-                done();
-                res.writeHead(200, {
-                    'content-type': 'text/plain'
+function getTransactions(user, cb) {
+    balances.find({
+        user_id: user._id
+    }, {
+        sort: {
+            date: -1
+        }
+    }, function(err, bals) {
+        //compute transactions
+        var arr = [];
+        for (var i = 0; i < bals.length; i++) {
+            if (bals[i + 1]) {
+                //newer number subtract older number
+                var diff = bals[i].balance - bals[i + 1].balance;
+                arr.push({
+                    amount: diff,
+                    date: bals[i].date
                 });
-                res.end('You are visitor number ' + result.rows[0].count);
-            });
-        });
+            }
+        }
+        cb(err, arr);
     });
-})
-server.listen(3001)
-*/
+}
